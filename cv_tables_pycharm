@@ -1,0 +1,233 @@
+from roboflow import Roboflow
+import numpy
+#print(numpy.__version__)
+import ultralytics
+#print(ultralytics.__version__)
+from ultralytics import YOLO
+from doctr.models import ocr_predictor
+from doctr.models import recognition_predictor
+import os
+import sys
+import time
+import csv
+import cv2
+import re
+import shutil
+import warnings
+warnings.filterwarnings("ignore", message=".*weights_only=False.*")
+
+rf = Roboflow(api_key="ODNygUs9xqfi2bwSAnWk")
+project = rf.workspace("s-workspace-gkrui").project("myobjectdetection400")
+version = project.version(1)
+dataset = version.download("yolov8")
+
+model_path = 'train11/weights/best.pt'
+model = YOLO(model_path)
+
+reco_model = recognition_predictor(arch='crnn_vgg16_bn', pretrained=True)
+
+# Определяем путь к папке, где лежит сам запущенный файл (.py или .exe)
+if getattr(sys, 'frozen', False):
+    # Если это скомпилированный .exe
+    base_path = os.path.dirname(sys.executable)
+else:
+    # Если это обычный запуск скрипта в PyCharm
+    base_path = os.path.dirname(os.path.abspath(__file__))
+
+output_dir = os.path.join(base_path, 'for_rename')
+review_dir = os.path.join(base_path, 'manual_review')
+
+print(f"Ищу for_rename папку здесь: {output_dir}")
+print(f"Ищу manual_review папку здесь: {review_dir}")
+
+
+def get_unique_name(target_name, folder1, folder2):
+    # """Проверяет уникальность имени сразу в двух папках"""
+    base, ext = os.path.splitext(target_name)
+    final_name = target_name
+    counter = 2
+
+    # Пока файл с таким именем есть ХОТЯ БЫ в одной из папок
+    while os.path.exists(os.path.join(folder1, final_name)) or \
+            os.path.exists(os.path.join(folder2, final_name)):
+        final_name = f"{base}_{counter}{ext}"
+        counter += 1
+
+    return final_name
+
+min_conf_limit = 0.9
+
+
+csvfile = open('renaming.csv', 'w', newline='', encoding='utf-8')
+writer = csv.writer(csvfile)
+writer.writerow(['File Name', 'New Name', 'Folder', 'DocTR Text', 'Conf Main', 'DocTR Others'])
+counter = 1
+
+files = [f for f in os.listdir(output_dir) if f.lower().endswith(('.jpg', '.jpeg'))]
+
+while True:
+    prefix = input("Введите префикс: ")
+
+    confirm = input(f"Вы ввели '{prefix}'. Уверены? (y/n): ").lower()
+
+    if confirm == 'y' or confirm == 'н':  # 'н' для русской раскладки
+        break
+    else:
+        print("Попробуйте снова.")
+
+print(f"Готово! Используем префикс: {prefix}")
+
+
+
+while True:
+    min_conf_limit = input("Введите порог уверенности (например, 0.9) : ")
+
+    confirm = input(f"Вы ввели '{min_conf_limit}'. Уверены? (y/n): ").lower()
+
+    if confirm == 'y' or confirm == 'н':  # добавил 'н' для русской раскладки
+        break
+    else:
+        print("Попробуйте снова.")
+
+print(f"Готово! Используем порог уверенности: {min_conf_limit}")
+min_conf_limit = float(min_conf_limit.replace(',','.'))
+
+start_time = time.time()
+
+for file_name in files:
+    img_path = os.path.join(output_dir, file_name)
+    img = cv2.imread(img_path)
+    if img is None: continue
+
+    results = model(img, verbose=False)
+
+
+
+    doctr_text = ''
+    best_doctr_text = ""
+    max_ocr_conf = -1.0
+
+    best_main_text = ""
+    best_main_conf = -1.0
+    all_other_findings = []
+
+    for r in results:
+
+        for box in r.boxes:
+
+            # Координаты и кроп
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            w, h = x2 - x1, y2 - y1
+            pad_w, pad_h = int(w * 0.02), int(h * 0.02)
+
+            crop = img[max(0, y1 + pad_h):min(img.shape[0], y2 - pad_h),
+                   max(0, x1 + pad_w):min(img.shape[1], x2 - pad_w)]
+
+            # Подготовка: добавляем поля и переводим в RGB
+            # Поля (padding) нужны, чтобы буквы не прижимались к краям
+            temp_crop = cv2.copyMakeBorder(crop, 15, 15, 15, 15, cv2.BORDER_REPLICATE)
+            img_rgb = cv2.cvtColor(temp_crop, cv2.COLOR_BGR2RGB)
+
+            # Прямое распознавание (без поиска блоков)
+            out = reco_model([img_rgb])
+            if not out: continue
+
+            # Сортируем все найденные слова по убыванию уверенности
+            # Теперь out[0] — это всегда самый надежный результат
+            sorted_out = sorted(out, key=lambda x: x[1], reverse=True)
+
+            current_text, current_conf = sorted_out[0]
+
+            if current_conf > max_ocr_conf:
+                max_ocr_conf = current_conf
+                # Чистим текст
+                best_doctr_text = "".join([c for c in current_text.lower() if c in '0123456789abcde'])
+
+                # Добавляем инфо о других словах в ЭТОМ ЖЕ боксе, если они есть
+                others = [word for word, conf in sorted_out[1:] if conf > 0.1]
+                if others:
+                    best_doctr_text += f" (еще: {' '.join(others)})"
+
+            for raw_text, conf in out:
+                # 1. Фильтруем текст
+                clean_t = "".join([c for c in raw_text.lower() if c in '0123456789abcde'])
+                if not clean_t: continue
+
+                # 2. Если это самый уверенный результат за всё время обработки ФАЙЛА
+                if conf > best_main_conf:
+                    # Если старый "чемпион" существовал, отправляем его в список "других"
+                    if best_main_text:
+                        all_other_findings.append(f"{best_main_text}({best_main_conf:.2f})")
+
+                    # Назначаем нового чемпиона
+                    best_main_conf = conf
+                    best_main_text = clean_t
+                else:
+                    # 3. Все остальные находки просто копим в список
+                    all_other_findings.append(f"{clean_t}({conf:.2f})")
+
+    main_column = best_main_text
+    conf_column = best_main_conf
+
+    others_column = ""
+    if all_other_findings:
+        unique_others = list(set(all_other_findings))
+        others_column = ", ".join(unique_others)  # Просто перечисляем через запятую
+
+    # Формируем итоговую строку для колонки DocTR
+    doctr_final_string = best_main_text
+    if all_other_findings:
+        # Убираем дубликаты, если вдруг нашли одно и то же в разных рамках
+        unique_others = list(set(all_other_findings))
+        doctr_final_string += f", [ДРУГОЕ: {', '.join(unique_others)}]"
+
+    # Форматируем базовое имя (например, 87a -> TUL0087a.jpg)
+    match = re.match(r"(\d+)(.*)", best_main_text)
+    if match:
+        digits, suffix = match.groups()
+        base_new_name = f"{prefix}{int(digits):04d}{suffix}.jpg"
+    else:
+        # Если цифр нет, используем что есть или старое имя
+        base_new_name = f"{prefix}_{best_main_text if best_main_text else 'unknown'}_{file_name}"
+
+    # Получаем уникальное имя, которого нет ни в одной из папок
+    final_file_name = get_unique_name(base_new_name, output_dir, review_dir)
+
+    # УСЛОВИЕ: Идеально или нет?
+    is_perfect = (float(conf_column) > min_conf_limit) and (not others_column)
+    destination_folder = output_dir if is_perfect else review_dir
+
+    # ФИНАЛЬНЫЙ ПЕРЕНОС С ПЕРЕИМЕНОВАНИЕМ
+    final_path = os.path.join(destination_folder, final_file_name)
+
+    print(
+        f"{counter}. {file_name} | New name: {final_file_name} | Text: {main_column} | conf:{conf_column:.3f} | Others: {others_column}")
+    # print(is_perfect,conf_column,others_column)
+    # print(float(conf_column),(float(conf_column) > 0.9),(not others_column))
+
+    # print(final_file_name)
+    # print(final_path)
+    # print(img_path)
+
+    try:
+        shutil.move(img_path, final_path)
+        status = "[OK]" if is_perfect else "[! ПРОВЕРКА !]"
+        print(f"{status} Файл {file_name} -> {destination_folder}/{final_file_name}")
+    except Exception as e:
+        print(f"Ошибка при перемещении {file_name}: {e}")
+
+    writer.writerow([file_name, final_file_name, destination_folder, main_column, best_main_conf, others_column])
+
+    counter += 1
+
+    # input("Нажмите Enter для перехода к следующему файлу...")
+
+print("Все фото проверены!")
+
+csvfile.close()
+end_time = time.time()
+elapsed_time = end_time - start_time
+
+print(f"Цикл выполнен за {elapsed_time:.4f} секунд")
+
+input('Работа программы завершена. Нажмите Enter для выхода.')
